@@ -2,16 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use acpi_tables::fadt::{FADT_F_HW_REDUCED_ACPI, FADT_F_PWR_BUTTON, FADT_F_SLP_BUTTON};
-use acpi_tables::{Dsdt, Fadt, Madt, Mcfg, Rsdp, Sdt, Xsdt, aml};
+use acpi_tables::{Dsdt, Fadt, Madt, Mcfg, Rsdp, Sdt, Srat, Xsdt, aml};
 use vm_allocator::AllocPolicy;
 
 use crate::Vcpu;
 use crate::acpi::x86_64::{
     apic_addr, rsdp_addr, setup_arch_dsdt, setup_arch_fadt, setup_interrupt_controllers,
+    setup_srat_structures,
 };
 use crate::arch::x86_64::layout;
 use crate::device_manager::DeviceManager;
+use crate::devices::virtio::mem::{VIRTIO_MEM_DEV_ID, VIRTIO_MEM_NUMA_NODE_PXM, VirtioMem};
 use crate::logger::{debug, error};
+use crate::utils::u32_mib_to_bytes;
 use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
 use crate::vstate::resources::ResourceAllocator;
 
@@ -132,22 +135,41 @@ impl AcpiTableWriter<'_> {
         self.write_acpi_table(resource_allocator, &mut madt)
     }
 
+    /// Build the SRAT table for the guest
+    ///
+    /// This puts the vCPUs and the boot memory in proximity domain 0 and the hotpluggable memory
+    /// region in a proximity domain of its own
+    fn build_srat(
+        &mut self,
+        resource_allocator: &mut ResourceAllocator,
+        nr_vcpus: u8,
+        hotplug_addr: GuestAddress,
+        hotplug_size: u64,
+    ) -> Result<u64, AcpiError> {
+        let mut srat = Srat::new(
+            OEM_ID,
+            *b"FCVMSRAT",
+            OEM_REVISION,
+            setup_srat_structures(
+                self.mem,
+                nr_vcpus,
+                hotplug_addr,
+                hotplug_size,
+                u32::from(VIRTIO_MEM_NUMA_NODE_PXM),
+            ),
+        );
+        self.write_acpi_table(resource_allocator, &mut srat)
+    }
+
     /// Build the XSDT table for the guest
     ///
-    /// Currently, we pass to the guest just FADT and MADT tables.
+    /// We pass to the guest the FADT, MADT and MCFG tables, and the SRAT when there is one.
     fn build_xsdt(
         &mut self,
         resource_allocator: &mut ResourceAllocator,
-        fadt_addr: u64,
-        madt_addr: u64,
-        mcfg_addr: u64,
+        tables: Vec<u64>,
     ) -> Result<u64, AcpiError> {
-        let mut xsdt = Xsdt::new(
-            OEM_ID,
-            *b"FCMVXSDT",
-            OEM_REVISION,
-            vec![fadt_addr, madt_addr, mcfg_addr],
-        );
+        let mut xsdt = Xsdt::new(OEM_ID, *b"FCMVXSDT", OEM_REVISION, tables);
         self.write_acpi_table(resource_allocator, &mut xsdt)
     }
 
@@ -191,26 +213,57 @@ pub(crate) fn create_acpi_tables(
     vcpus: &[Vcpu],
 ) -> Result<(), AcpiError> {
     let mut writer = AcpiTableWriter { mem };
+    let nr_vcpus: u8 = vcpus.len().try_into().unwrap();
     let dsdt_addr = writer.build_dsdt(device_manager, resource_allocator)?;
 
     let fadt_addr = writer.build_fadt(resource_allocator, dsdt_addr)?;
-    let madt_addr = writer.build_madt(resource_allocator, vcpus.len().try_into().unwrap())?;
+    let madt_addr = writer.build_madt(resource_allocator, nr_vcpus)?;
     let mcfg_addr = writer.build_mcfg(resource_allocator, layout::PCI_MMCONFIG_START)?;
-    let xsdt_addr = writer.build_xsdt(resource_allocator, fadt_addr, madt_addr, mcfg_addr)?;
+    let mut tables = vec![fadt_addr, madt_addr, mcfg_addr];
+    if let Some((hotplug_addr, hotplug_size)) = numa_node_hotplug_region(device_manager) {
+        let srat_addr =
+            writer.build_srat(resource_allocator, nr_vcpus, hotplug_addr, hotplug_size)?;
+        tables.push(srat_addr);
+    }
+    let xsdt_addr = writer.build_xsdt(resource_allocator, tables)?;
     writer.build_rsdp(xsdt_addr)
+}
+
+/// The region of the virtio-mem device (its guest physical address and size), if there is a
+/// device and its memory is a NUMA node of its own.
+fn numa_node_hotplug_region(device_manager: &DeviceManager) -> Option<(GuestAddress, u64)> {
+    device_manager
+        .with_virtio_device(VIRTIO_MEM_DEV_ID, |mem: &mut VirtioMem| {
+            mem.numa_node()
+                .then(|| (mem.guest_address(), u32_mib_to_bytes(mem.total_size_mib())))
+        })
+        .ok()
+        .flatten()
 }
 
 #[cfg(test)]
 mod tests {
-    use acpi_tables::Sdt;
-    use vm_memory::Bytes;
+    use std::sync::Arc;
 
-    use crate::acpi::{AcpiError, AcpiTableWriter};
+    use acpi_tables::Sdt;
+    use vm_memory::{Bytes, GuestAddress};
+
+    use crate::acpi::x86_64::{rsdp_addr, setup_srat_structures};
+    use crate::acpi::{AcpiError, AcpiTableWriter, create_acpi_tables};
     use crate::arch::x86_64::layout::{SYSTEM_MEM_SIZE, SYSTEM_MEM_START};
-    use crate::builder::tests::default_vmm;
-    use crate::utils::u64_to_usize;
+    use crate::builder::tests::{default_kernel_cmdline, default_vmm, insert_virtio_mem_device};
+    use crate::device_manager::tests::default_device_manager;
+    use crate::test_utils::multi_region_mem;
+    use crate::utils::{mib_to_bytes, u64_to_usize};
+    use crate::vmm_config::boot_source::BootSourceConfig;
+    use crate::vmm_config::instance_info::InstanceInfo;
+    use crate::vmm_config::machine_config::MachineConfig;
+    use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
+    use crate::vstate::memory::GuestMemoryMmap;
     use crate::vstate::resources::ResourceAllocator;
+    use crate::vstate::vm::Vm;
     use crate::vstate::vm::tests::setup_vm_with_memory;
+    use crate::{EventManager, Vmm};
 
     struct MockSdt(Vec<u8>);
 
@@ -321,6 +374,163 @@ mod tests {
             ),
             "{:?}",
             err
+        );
+    }
+
+    fn read_u32(mem: &GuestMemoryMmap, addr: u64) -> u32 {
+        mem.read_obj(GuestAddress(addr)).unwrap()
+    }
+
+    fn read_u64(mem: &GuestMemoryMmap, addr: u64) -> u64 {
+        mem.read_obj(GuestAddress(addr)).unwrap()
+    }
+
+    fn read_bytes(mem: &GuestMemoryMmap, addr: u64, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        mem.read_slice(&mut buf, GuestAddress(addr)).unwrap();
+        buf
+    }
+
+    /// Builds the ACPI tables of a microVM with 2 vCPUs and 128 MiB of boot memory, with no
+    /// virtio-mem device (None) or with one whose `numa_node` is given, and returns the guest
+    /// memory and the address and signature of each table the XSDT lists, found through the RSDP.
+    fn acpi_tables(numa_node: Option<bool>) -> (GuestMemoryMmap, Vec<(u64, [u8; 4])>) {
+        let mut vm = setup_vm_with_memory(mib_to_bytes(128));
+        let vcpus = vm.create_vcpus(2).unwrap();
+        let vm = Arc::new(vm);
+        let mut vmm = Vmm {
+            instance_info: InstanceInfo::default(),
+            machine_config: MachineConfig::default(),
+            boot_source_config: BootSourceConfig::default(),
+            shutdown_exit_code: None,
+            vm: Vm::Kvm(vm.clone()),
+            device_manager: default_device_manager(),
+        };
+        let mut event_manager = EventManager::new().unwrap();
+        let mut cmdline = default_kernel_cmdline();
+        if let Some(numa_node) = numa_node {
+            let config = MemoryHotplugConfig {
+                total_size_mib: 1024,
+                block_size_mib: 2,
+                slot_size_mib: 128,
+                numa_node,
+            };
+            insert_virtio_mem_device(&mut vmm, &mut cmdline, &mut event_manager, config);
+        }
+
+        let mem = vm.guest_memory();
+        create_acpi_tables(
+            mem,
+            &mut vmm.device_manager,
+            &mut vm.resource_allocator(),
+            &vcpus,
+        )
+        .unwrap();
+
+        // XSDT address in the RSDP
+        let xsdt_addr = read_u64(mem, rsdp_addr().0 + 24);
+        assert_eq!(read_bytes(mem, xsdt_addr, 4), b"XSDT");
+        let xsdt_len = u64::from(read_u32(mem, xsdt_addr + 4));
+        let tables = (0..(xsdt_len - 36) / 8)
+            .map(|i| {
+                let addr = read_u64(mem, xsdt_addr + 36 + 8 * i);
+                let sig: [u8; 4] = read_bytes(mem, addr, 4).try_into().unwrap();
+                (addr, sig)
+            })
+            .collect();
+        (mem.clone(), tables)
+    }
+
+    #[test]
+    fn test_xsdt_srat_only_with_numa_node() {
+        let signatures =
+            |tables: &[(u64, [u8; 4])]| tables.iter().map(|(_, sig)| *sig).collect::<Vec<_>>();
+        let v1_17 = vec![*b"FACP", *b"APIC", *b"MCFG"];
+
+        // No hotplug, and hotplug without numa_node: the tables of v1.17.0
+        let (_, no_hotplug) = acpi_tables(None);
+        assert_eq!(signatures(&no_hotplug), v1_17);
+        let (mem_off, hotplug) = acpi_tables(Some(false));
+        assert_eq!(signatures(&hotplug), v1_17);
+
+        // With numa_node: the same tables at the same addresses and with the same bytes, then
+        // the SRAT
+        let (mem, numa) = acpi_tables(Some(true));
+        assert_eq!(
+            signatures(&numa),
+            vec![*b"FACP", *b"APIC", *b"MCFG", *b"SRAT"]
+        );
+        assert_eq!(numa[..3], hotplug[..]);
+        for (addr, _) in &hotplug {
+            let len = read_u32(&mem_off, addr + 4) as usize;
+            assert_eq!(
+                read_bytes(&mem, *addr, len),
+                read_bytes(&mem_off, *addr, len)
+            );
+        }
+
+        // The SRAT: 2 vCPUs and the one boot memory range in domain 0, the virtio-mem region
+        // (as insert_virtio_mem_device places it) in domain 1, hot-pluggable
+        let srat_addr = numa[3].0;
+        let len = read_u32(&mem, srat_addr + 4) as usize;
+        assert_eq!(len, 48 + 2 * 16 + 2 * 40);
+        let srat = read_bytes(&mem, srat_addr, len);
+        assert_eq!(srat[8], 3);
+        assert_eq!(srat.iter().fold(0u8, |acc, x| acc.wrapping_add(*x)), 0);
+        for cpu in 0..2 {
+            let s = &srat[48 + 16 * cpu..48 + 16 * (cpu + 1)];
+            assert_eq!(&s[0..4], &[0, 16, 0, u8::try_from(cpu).unwrap()]);
+            assert_eq!(s[4] & 1, 1);
+        }
+        let boot = &srat[80..120];
+        assert_eq!(&boot[0..6], &[1, 40, 0, 0, 0, 0]);
+        assert_eq!(u64::from_le_bytes(boot[8..16].try_into().unwrap()), 0);
+        assert_eq!(
+            u64::from_le_bytes(boot[16..24].try_into().unwrap()),
+            mib_to_bytes(128) as u64
+        );
+        assert_eq!(boot[28], 0b01);
+        let hotplug = &srat[120..160];
+        assert_eq!(&hotplug[0..6], &[1, 40, 1, 0, 0, 0]);
+        assert_eq!(
+            u64::from_le_bytes(hotplug[8..16].try_into().unwrap()),
+            512 << 30
+        );
+        assert_eq!(
+            u64::from_le_bytes(hotplug[16..24].try_into().unwrap()),
+            mib_to_bytes(1024) as u64
+        );
+        assert_eq!(hotplug[28], 0b11);
+    }
+
+    #[test]
+    fn test_srat_structures_two_boot_ranges() {
+        // Boot memory below and above the 32-bit gap
+        let mem = multi_region_mem(&[
+            (GuestAddress(0), mib_to_bytes(2)),
+            (GuestAddress(4 << 30), mib_to_bytes(2)),
+        ]);
+        let s = setup_srat_structures(&mem, 1, GuestAddress(512 << 30), 1 << 30, 1);
+        assert_eq!(s.len(), 16 + 3 * 40);
+        let ranges: Vec<(u64, u64, u32, u32)> = s[16..]
+            .chunks(40)
+            .map(|m| {
+                assert_eq!(&m[0..2], &[1, 40]);
+                (
+                    u64::from_le_bytes(m[8..16].try_into().unwrap()),
+                    u64::from_le_bytes(m[16..24].try_into().unwrap()),
+                    u32::from_le_bytes(m[2..6].try_into().unwrap()),
+                    u32::from_le_bytes(m[28..32].try_into().unwrap()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                (0, mib_to_bytes(2) as u64, 0, 1),
+                (4 << 30, mib_to_bytes(2) as u64, 0, 1),
+                (512 << 30, 1 << 30, 1, 3),
+            ]
         );
     }
 }

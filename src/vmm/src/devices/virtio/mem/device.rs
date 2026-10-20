@@ -15,11 +15,11 @@ use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
 use crate::devices::virtio::generated::virtio_mem::{
-    self, VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE, virtio_mem_config,
+    self, VIRTIO_MEM_F_ACPI_PXM, VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE, virtio_mem_config,
 };
-use crate::devices::virtio::mem::VIRTIO_MEM_DEV_ID;
 use crate::devices::virtio::mem::metrics::METRICS;
 use crate::devices::virtio::mem::request::{BlockRangeState, Request, RequestedRange, Response};
+use crate::devices::virtio::mem::{VIRTIO_MEM_DEV_ID, VIRTIO_MEM_NUMA_NODE_PXM};
 use crate::devices::virtio::queue::{
     DescriptorChain, FIRECRACKER_MAX_QUEUE_SIZE, InvalidAvailIdx, Queue, QueueConfig, QueueError,
 };
@@ -108,6 +108,10 @@ pub struct VirtioMemStatus {
     pub plugged_size_mib: u32,
     /// Requested memory size in MiB.
     pub requested_size_mib: u32,
+    /// Whether the hotpluggable memory is a NUMA node of its own in the guest (left out when
+    /// false).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub numa_node: bool,
 }
 
 impl VirtioMem {
@@ -117,12 +121,18 @@ impl VirtioMem {
         total_size_mib: u32,
         block_size_mib: u32,
         slot_size_mib: u32,
+        numa_node: bool,
     ) -> Result<Self, VirtioMemError> {
         let queues = vec![Queue::new(FIRECRACKER_MAX_QUEUE_SIZE); MEM_NUM_QUEUES];
         let config = virtio_mem_config {
             addr: addr.raw_value(),
             region_size: u32_mib_to_bytes(total_size_mib),
             block_size: u32_mib_to_bytes(block_size_mib),
+            node_id: if numa_node {
+                VIRTIO_MEM_NUMA_NODE_PXM
+            } else {
+                0
+            },
             ..Default::default()
         };
         let plugged_blocks = BitVec::repeat(
@@ -130,13 +140,17 @@ impl VirtioMem {
             u64_to_usize((total_size_mib / block_size_mib).into()),
         );
 
-        Self::from_state(
+        let mut mem = Self::from_state(
             vm,
             queues,
             config,
             u64_to_usize(u32_mib_to_bytes(slot_size_mib)),
             plugged_blocks,
-        )
+        )?;
+        if numa_node {
+            mem.avail_features |= 1 << VIRTIO_MEM_F_ACPI_PXM;
+        }
+        Ok(mem)
     }
 
     pub fn from_state(
@@ -194,6 +208,12 @@ impl VirtioMem {
         bytes_to_u32_mib(self.config.requested_size)
     }
 
+    /// Whether the device memory is a NUMA node of its own: the device offers
+    /// `VIRTIO_MEM_F_ACPI_PXM` and its `node_id` is the proximity domain of its range in the SRAT.
+    pub fn numa_node(&self) -> bool {
+        self.avail_features & (1 << VIRTIO_MEM_F_ACPI_PXM) != 0
+    }
+
     pub fn status(&self) -> VirtioMemStatus {
         VirtioMemStatus {
             block_size_mib: self.block_size_mib(),
@@ -201,6 +221,7 @@ impl VirtioMem {
             slot_size_mib: self.slot_size_mib(),
             plugged_size_mib: self.plugged_size_mib(),
             requested_size_mib: self.requested_size_mib(),
+            numa_node: self.numa_node(),
         }
     }
 
@@ -780,6 +801,10 @@ pub(crate) mod test_utils {
     }
 
     pub(crate) fn default_virtio_mem() -> VirtioMem {
+        virtio_mem_with_numa_node(false)
+    }
+
+    pub(crate) fn virtio_mem_with_numa_node(numa_node: bool) -> VirtioMem {
         let mut vm = setup_vm_with_memory(0x1000);
         let addr = GuestAddress(512 << 30);
         vm.register_hotpluggable_memory_region(
@@ -795,7 +820,7 @@ pub(crate) mod test_utils {
         )
         .unwrap();
         let vm = Arc::new(vm);
-        VirtioMem::new(vm, addr, 1024, 2, 128).unwrap()
+        VirtioMem::new(vm, addr, 1024, 2, 128, numa_node).unwrap()
     }
 }
 
@@ -804,7 +829,9 @@ mod tests {
 
     use super::*;
     use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
-    use crate::devices::virtio::mem::device::test_utils::default_virtio_mem;
+    use crate::devices::virtio::mem::device::test_utils::{
+        default_virtio_mem, virtio_mem_with_numa_node,
+    };
     use crate::devices::virtio::queue::VIRTQ_DESC_F_WRITE;
     use crate::devices::virtio::test_utils::test::VirtioTestHelper;
     use crate::utils::mib_to_bytes;
@@ -924,8 +951,43 @@ mod tests {
                 slot_size_mib: 128,
                 plugged_size_mib: 0,
                 requested_size_mib: 0,
+                numa_node: false,
             }
         );
+    }
+
+    #[test]
+    fn test_numa_node() {
+        // Off: the features and the configuration space of a device without the option
+        let mem = virtio_mem_with_numa_node(false);
+        assert!(!mem.numa_node());
+        assert_eq!(
+            mem.avail_features(),
+            (1 << VIRTIO_F_VERSION_1) | (1 << VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE)
+        );
+        assert_eq!(mem.config.node_id, 0);
+        let expected = virtio_mem_config {
+            addr: 512 << 30,
+            region_size: u32_mib_to_bytes(1024),
+            block_size: u32_mib_to_bytes(2),
+            ..Default::default()
+        };
+        assert_eq!(mem.config_as_bytes(), expected.as_slice());
+
+        // On: ACPI_PXM is offered and node_id is the proximity domain 1
+        let mem = virtio_mem_with_numa_node(true);
+        assert!(mem.numa_node());
+        assert_eq!(
+            mem.avail_features(),
+            (1 << VIRTIO_F_VERSION_1)
+                | (1 << VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE)
+                | (1 << VIRTIO_MEM_F_ACPI_PXM)
+        );
+        assert_eq!(mem.config.node_id, 1);
+        let config = mem.config_as_bytes();
+        // node_id is the le16 at offset 8
+        assert_eq!(u16::from_le_bytes(config[8..10].try_into().unwrap()), 1);
+        assert!(mem.status().numa_node);
     }
 
     #[allow(clippy::cast_possible_truncation)]

@@ -831,6 +831,7 @@ fn attach_virtio_mem_device(
             config.total_size_mib,
             config.block_size_mib,
             config.slot_size_mib,
+            config.numa_node,
         )
         .map_err(|e| StartMicrovmError::Internal(VmmError::VirtioMem(e)))?,
     ));
@@ -1663,6 +1664,7 @@ pub(crate) mod tests {
             total_size_mib: 1024,
             block_size_mib: 2,
             slot_size_mib: 128,
+            numa_node: false,
         };
 
         let mut cmdline = default_kernel_cmdline();

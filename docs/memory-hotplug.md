@@ -68,6 +68,15 @@ started, the hotpluggable region will be completely unplugged.
   improve performance for large memory operations but reduce unplugging
   protection efficiency.
 
+- `numa_node` (optional, default: false, x86_64 only): Make the hotpluggable
+  memory a NUMA node of its own in the guest. Firecracker then gives the guest an
+  ACPI SRAT that puts the vCPUs and the boot memory in proximity domain 0 and the
+  hotpluggable region in proximity domain 1 (hot-pluggable), and the device
+  offers `VIRTIO_MEM_F_ACPI_PXM` with `node_id` 1, so the guest plugs the memory
+  into node 1. The guest kernel needs `CONFIG_NUMA` and `CONFIG_ACPI_NUMA`. When
+  false, the guest sees no SRAT and the device does not offer the feature. On
+  aarch64 a value of true is rejected.
+
 It is recommended to leave these values to the default unless strict memory
 protection is required, in which case `block_size_mib` should be equal to
 `slot_size_mib`. Note that this will make it harder for the guest kernel to find
@@ -136,6 +145,8 @@ This returns information about the current device state, including:
   protection)
 - `plugged_size_mib`: Currently plugged (available) memory by the guest
 - `requested_size_mib`: Target memory size set by the host
+- `numa_node`: present (and true) only when the hotpluggable memory is a NUMA
+  node of its own
 
 ## Operating the virtio-mem device
 

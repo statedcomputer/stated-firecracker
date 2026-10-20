@@ -62,6 +62,7 @@ mod tests {
             total_size_mib: 2048,
             block_size_mib: VIRTIO_MEM_DEFAULT_BLOCK_SIZE_MIB,
             slot_size_mib: VIRTIO_MEM_DEFAULT_SLOT_SIZE_MIB,
+            numa_node: false,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_memory_hotplug(&Body::new(body)).unwrap()),
@@ -78,6 +79,7 @@ mod tests {
             total_size_mib: 2048,
             block_size_mib: 64,
             slot_size_mib: 64,
+            numa_node: false,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_memory_hotplug(&Body::new(body)).unwrap()),

@@ -5,12 +5,19 @@ use std::mem::size_of;
 
 use acpi_tables::fadt::IAPC_BOOT_ARG_FLAGS_VGA_NOT_PRESENT;
 use acpi_tables::madt::{IoAPIC, LocalAPIC};
+use acpi_tables::srat::{
+    MemoryAffinity, ProcessorLocalApicAffinity, SRAT_AFFINITY_ENABLED, SRAT_MEMORY_HOT_PLUGGABLE,
+};
 use acpi_tables::{Fadt, aml};
-use vm_memory::GuestAddress;
+use vm_memory::{Address, GuestAddress, GuestMemoryBackend, GuestMemoryRegion};
 use zerocopy::IntoBytes;
 
 use crate::arch::x86_64::layout;
 use crate::device_manager::legacy::PortIODeviceManager;
+use crate::vstate::memory::{GuestMemoryMmap, GuestRegionType};
+
+/// The proximity domain of the vCPUs and of the boot memory in the SRAT
+const SRAT_BOOT_PROXIMITY_DOMAIN: u32 = 0;
 
 #[inline(always)]
 pub(crate) fn setup_interrupt_controllers(nr_vcpus: u8) -> Vec<u8> {
@@ -22,6 +29,48 @@ pub(crate) fn setup_interrupt_controllers(nr_vcpus: u8) -> Vec<u8> {
         ic.extend_from_slice(LocalAPIC::new(i).as_bytes());
     }
     ic
+}
+
+/// The affinity structures of the SRAT: each vCPU (APIC id = vCPU index, as in the MADT) and each
+/// range of boot memory in proximity domain 0, and the hotpluggable memory region in the given
+/// proximity domain, hot-pluggable.
+pub(crate) fn setup_srat_structures(
+    mem: &GuestMemoryMmap,
+    nr_vcpus: u8,
+    hotplug_addr: GuestAddress,
+    hotplug_size: u64,
+    hotplug_proximity_domain: u32,
+) -> Vec<u8> {
+    let mut structures = Vec::new();
+    for i in 0..nr_vcpus {
+        structures.extend_from_slice(
+            ProcessorLocalApicAffinity::new(i, SRAT_BOOT_PROXIMITY_DOMAIN).as_bytes(),
+        );
+    }
+    for region in mem
+        .iter()
+        .filter(|region| region.region_type == GuestRegionType::Dram)
+    {
+        structures.extend_from_slice(
+            MemoryAffinity::new(
+                region.start_addr().raw_value(),
+                region.len(),
+                SRAT_BOOT_PROXIMITY_DOMAIN,
+                SRAT_AFFINITY_ENABLED,
+            )
+            .as_bytes(),
+        );
+    }
+    structures.extend_from_slice(
+        MemoryAffinity::new(
+            hotplug_addr.raw_value(),
+            hotplug_size,
+            hotplug_proximity_domain,
+            SRAT_AFFINITY_ENABLED | SRAT_MEMORY_HOT_PLUGGABLE,
+        )
+        .as_bytes(),
+    );
+    structures
 }
 
 #[inline(always)]

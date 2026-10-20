@@ -22,6 +22,8 @@ pub enum MemoryHotplugConfigError {
     TotalSizeTooSmall(u32),
     /// Total size must be a multiple of slot size ({0} MiB)
     TotalSizeNotMultipleOfSlotSize(u32),
+    /// A NUMA node of its own for the hotpluggable memory is only supported on x86_64
+    NumaNodeNotSupported,
 }
 
 fn default_block_size_mib() -> u32 {
@@ -44,6 +46,13 @@ pub struct MemoryHotplugConfig {
     /// Slot size in MiB. A slot is the smallest unit the host can (de)attach memory
     #[serde(default = "default_slot_size_mib")]
     pub slot_size_mib: u32,
+    /// Whether the hotpluggable memory is a NUMA node of its own in the guest (node 1, x86_64
+    /// only). When true, an ACPI SRAT puts the boot memory and the vCPUs in proximity domain 0
+    /// and the hotpluggable region in proximity domain 1, and the device offers
+    /// `VIRTIO_MEM_F_ACPI_PXM` with `node_id` 1. Left out of the serialized configuration when
+    /// false, which is then the configuration of a device without this option.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub numa_node: bool,
 }
 
 impl MemoryHotplugConfig {
@@ -82,6 +91,11 @@ impl MemoryHotplugConfig {
             ));
         }
 
+        // Only x86_64 has the ACPI SRAT that describes the node to the guest
+        if cfg!(not(target_arch = "x86_64")) && self.numa_node {
+            return Err(MemoryHotplugConfigError::NumaNodeNotSupported);
+        }
+
         Ok(())
     }
 }
@@ -92,6 +106,7 @@ impl From<&VirtioMem> for MemoryHotplugConfig {
             total_size_mib: mem.total_size_mib(),
             block_size_mib: mem.block_size_mib(),
             slot_size_mib: mem.slot_size_mib(),
+            numa_node: mem.numa_node(),
         }
     }
 }
@@ -116,6 +131,7 @@ mod tests {
             total_size_mib: 1024,
             block_size_mib: 2,
             slot_size_mib: 128,
+            numa_node: false,
         };
         config.validate().unwrap();
     }
@@ -126,6 +142,7 @@ mod tests {
             total_size_mib: 1024,
             block_size_mib: 1,
             slot_size_mib: 128,
+            numa_node: false,
         };
         match config.validate() {
             Err(MemoryHotplugConfigError::BlockSizeTooSmall(min)) => assert_eq!(min, 2),
@@ -139,6 +156,7 @@ mod tests {
             total_size_mib: 1024,
             block_size_mib: 3,
             slot_size_mib: 128,
+            numa_node: false,
         };
         match config.validate() {
             Err(MemoryHotplugConfigError::BlockSizeNotPowerOfTwo) => {}
@@ -152,6 +170,7 @@ mod tests {
             total_size_mib: 1024,
             block_size_mib: 2,
             slot_size_mib: 1,
+            numa_node: false,
         };
         match config.validate() {
             Err(MemoryHotplugConfigError::SlotSizeTooSmall(min)) => assert_eq!(min, 128),
@@ -165,6 +184,7 @@ mod tests {
             total_size_mib: 1024,
             block_size_mib: 4,
             slot_size_mib: 130,
+            numa_node: false,
         };
         match config.validate() {
             Err(MemoryHotplugConfigError::SlotSizeNotMultipleOfBlockSize(block_size)) => {
@@ -180,6 +200,7 @@ mod tests {
             total_size_mib: 64,
             block_size_mib: 2,
             slot_size_mib: 128,
+            numa_node: false,
         };
         match config.validate() {
             Err(MemoryHotplugConfigError::TotalSizeTooSmall(slot_size)) => {
@@ -195,6 +216,7 @@ mod tests {
             total_size_mib: 1000,
             block_size_mib: 2,
             slot_size_mib: 128,
+            numa_node: false,
         };
         match config.validate() {
             Err(MemoryHotplugConfigError::TotalSizeNotMultipleOfSlotSize(slot_size)) => {
@@ -219,6 +241,7 @@ mod tests {
                 total_size_mib: 1024,
                 block_size_mib: 2,
                 slot_size_mib: 128,
+                numa_node: false,
             }
         );
     }
@@ -229,9 +252,70 @@ mod tests {
             total_size_mib: 1024,
             block_size_mib: 4,
             slot_size_mib: 256,
+            numa_node: false,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: MemoryHotplugConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config, deserialized);
+    }
+
+    #[test]
+    fn test_numa_node() {
+        // Absent: false
+        let json = r#"{
+            "total_size_mib": 1024
+        }"#;
+        let config: MemoryHotplugConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.numa_node);
+
+        // Given
+        let json = r#"{
+            "total_size_mib": 1024,
+            "numa_node": true
+        }"#;
+        let config: MemoryHotplugConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config,
+            MemoryHotplugConfig {
+                total_size_mib: 1024,
+                block_size_mib: 2,
+                slot_size_mib: 128,
+                numa_node: true,
+            }
+        );
+
+        // Not a bool
+        let json = r#"{
+            "total_size_mib": 1024,
+            "numa_node": 1
+        }"#;
+        serde_json::from_str::<MemoryHotplugConfig>(json).unwrap_err();
+
+        // Serialized with the field, and read back
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""numa_node":true"#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<MemoryHotplugConfig>(&json).unwrap(),
+            config
+        );
+
+        #[cfg(target_arch = "x86_64")]
+        config.validate().unwrap();
+        #[cfg(target_arch = "aarch64")]
+        assert!(matches!(
+            config.validate(),
+            Err(MemoryHotplugConfigError::NumaNodeNotSupported)
+        ));
+
+        // Off: left out of the serialized configuration, as before the field existed
+        let config = MemoryHotplugConfig {
+            numa_node: false,
+            ..config
+        };
+        config.validate().unwrap();
+        assert_eq!(
+            serde_json::to_string(&config).unwrap(),
+            r#"{"total_size_mib":1024,"block_size_mib":2,"slot_size_mib":128}"#
+        );
     }
 }

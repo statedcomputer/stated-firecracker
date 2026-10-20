@@ -102,6 +102,7 @@ pub fn create_vmm(
             total_size_mib: 1024,
             block_size_mib: 2,
             slot_size_mib: 128,
+            numa_node: false,
         });
     }
 

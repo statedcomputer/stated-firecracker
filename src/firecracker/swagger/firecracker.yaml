@@ -2230,6 +2230,12 @@ definitions:
         maximum: 4294967295
         description: (Logical) Block size for the hotpluggable memory in MiB. This will determine the logical
           granularity of hot-plug memory for the guest. Refer to the device documentation on how to tune this value.
+      numa_node:
+        type: boolean
+        default: false
+        description: Make the hotpluggable memory a NUMA node of its own (node 1) in the guest, apart from the
+          boot memory and the vCPUs (node 0), through an ACPI SRAT and the device's VIRTIO_MEM_F_ACPI_PXM feature.
+          Supported on x86_64 only. Refer to the device documentation.
 
   MemoryHotplugSizeUpdate:
     type: object
@@ -2262,6 +2268,10 @@ definitions:
       requested_size_mib:
         type: integer
         description: Requested size for the hotpluggable memory in MiB.
+      numa_node:
+        type: boolean
+        description: Whether the hotpluggable memory is a NUMA node of its own in the guest. Present only
+          when true.
 
   FirecrackerVersion:
     type: object

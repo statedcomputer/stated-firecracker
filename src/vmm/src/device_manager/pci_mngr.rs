@@ -718,11 +718,7 @@ impl<'a> Persist<'a> for PciDevices {
             let ctor_args = VirtioMemConstructorArgs::new(Arc::clone(constructor_args.vm));
             let device = VirtioMem::restore(ctor_args, &memory_device.device_state)?;
 
-            constructor_args.vm_resources.memory_hotplug = Some(MemoryHotplugConfig {
-                total_size_mib: device.total_size_mib(),
-                block_size_mib: device.block_size_mib(),
-                slot_size_mib: device.slot_size_mib(),
-            });
+            constructor_args.vm_resources.memory_hotplug = Some(MemoryHotplugConfig::from(&device));
 
             let arcd_device = Arc::new(Mutex::new(device));
             pci_devices.restore_pci_device(
@@ -902,6 +898,7 @@ mod tests {
                 total_size_mib: 1024,
                 block_size_mib: 2,
                 slot_size_mib: 128,
+                numa_node: false,
             };
             insert_virtio_mem_device(
                 &mut vmm,

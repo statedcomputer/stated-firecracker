@@ -15,5 +15,8 @@ pub(crate) const MEM_QUEUE: usize = 0;
 
 pub const VIRTIO_MEM_DEFAULT_BLOCK_SIZE_MIB: u32 = 2;
 pub const VIRTIO_MEM_DEFAULT_SLOT_SIZE_MIB: u32 = 128;
+/// The ACPI proximity domain of the hotpluggable memory when it is a NUMA node of its own: the
+/// device's `node_id` and the domain of its range in the SRAT.
+pub const VIRTIO_MEM_NUMA_NODE_PXM: u16 = 1;
 
 pub const VIRTIO_MEM_DEV_ID: &str = "mem";
