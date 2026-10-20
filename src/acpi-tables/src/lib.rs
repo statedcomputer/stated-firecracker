@@ -12,6 +12,7 @@ pub mod fadt;
 pub mod madt;
 pub mod mcfg;
 pub mod rsdp;
+pub mod srat;
 pub mod xsdt;
 
 pub use aml::Aml;
@@ -20,6 +21,7 @@ pub use fadt::Fadt;
 pub use madt::Madt;
 pub use mcfg::Mcfg;
 pub use rsdp::Rsdp;
+pub use srat::Srat;
 pub use xsdt::Xsdt;
 use zerocopy::little_endian::{U32, U64};
 use zerocopy::{Immutable, IntoBytes};
