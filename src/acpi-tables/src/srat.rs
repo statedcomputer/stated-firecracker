@@ -109,6 +109,8 @@ pub struct Srat {
 }
 
 impl Srat {
+    /// Creates the table from `structures`, the encoded affinity structures. They describe a few
+    /// vCPUs and memory ranges, so the table's length (a few KiB at most) fits its u32 field.
     pub fn new(
         oem_id: [u8; 6],
         oem_table_id: [u8; 8],
@@ -118,8 +120,6 @@ impl Srat {
         let length = size_of::<SratHeader>() + structures.len();
         let sdt_header = SdtHeader::new(
             *b"SRAT",
-            // It is ok to unwrap the conversion of `length` to u32. The structures describe a few
-            // vCPUs and memory ranges, so `length` is a few KiB at most.
             length.try_into().unwrap(),
             3,
             oem_id,
