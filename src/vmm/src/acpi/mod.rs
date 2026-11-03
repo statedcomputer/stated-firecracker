@@ -399,12 +399,17 @@ mod tests {
         let vcpus = vm.create_vcpus(2).unwrap();
         let vm = Arc::new(vm);
         let mut vmm = Vmm {
+            checkpoint: Default::default(),
             instance_info: InstanceInfo::default(),
             machine_config: MachineConfig::default(),
             boot_source_config: BootSourceConfig::default(),
             shutdown_exit_code: None,
             vm: Vm::Kvm(vm.clone()),
             device_manager: default_device_manager(),
+            #[cfg(target_arch = "x86_64")]
+            stopped_clock: None,
+            resume_refused: None,
+            filler: Default::default(),
         };
         let mut event_manager = EventManager::new().unwrap();
         let mut cmdline = default_kernel_cmdline();
