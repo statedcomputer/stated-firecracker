@@ -168,7 +168,7 @@ use crate::vmm_config::net::NetworkInterfaceConfig;
 use crate::vmm_config::space::{FillStatus, MemoryRegion, MemoryRegions};
 use crate::vmm_config::vsock::VsockDeviceConfig;
 pub use crate::vstate::kvm::Kvm;
-use crate::vstate::memory::{GuestMemoryMmap, GuestMemoryRegion};
+use crate::vstate::memory::{GuestMemoryMmap, GuestMemoryRegion, GuestRegionType};
 #[cfg(target_arch = "aarch64")]
 use crate::vstate::vcpu::VcpuState;
 pub use crate::vstate::vcpu::{Vcpu, VcpuConfig, VcpuEvent, VcpuHandle, VcpuResponse};
@@ -687,17 +687,28 @@ impl Vmm {
             .vm
             .as_kvm()
             .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
-        let ranges = kvm_vm
-            .guest_memory()
-            .iter()
-            .flat_map(|region| region.plugged_slots())
-            .map(|slot| {
-                (
+        // Each slot of a hotplug region carries the reading of its plugged bit, so that a slot
+        // that the guest unplugs during the fill is skipped (`space::populate_write`).
+        let memory = kvm_vm.guest_memory().clone();
+        let mut ranges = Vec::new();
+        for (index, region) in kvm_vm.guest_memory().iter().enumerate() {
+            let hotplug = region.region_type == GuestRegionType::Hotpluggable;
+            for slot in region.plugged_slots() {
+                let (addr, len) = (
                     slot.slice.ptr_guard_mut().as_ptr() as usize,
                     slot.slice.len(),
-                )
-            })
-            .collect();
+                );
+                let plugged: Option<space::StillPlugged> = hotplug.then(|| {
+                    let (memory, at) = (memory.clone(), (slot.slot - region.slot_from) as usize);
+                    Box::new(move || {
+                        memory.iter().nth(index).is_some_and(|r| {
+                            r.plugged.lock().expect("Poisoned lock").get(at).is_some_and(|b| *b)
+                        })
+                    }) as space::StillPlugged
+                });
+                ranges.push(space::HostRange { addr, len, plugged });
+            }
+        }
         self.filler.start(ranges)?;
         Ok(())
     }

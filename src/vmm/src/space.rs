@@ -9,6 +9,11 @@
 //! guest runs on: on the VMM thread it would stop every device for seconds for each GiB. The
 //! thread is started before the seccomp filter of the VMM thread is set (that filter allows no
 //! new thread) and sets its own filter, of the thread category `fill`.
+//!
+//! The fill goes slot by slot. The guest may unplug a slot of its hotplug region while the fill
+//! runs: the slot is then `PROT_NONE` and its populate fails (`EINVAL`). Such a slot, one that is
+//! no longer plugged when its populate fails, is skipped and the fill goes on; a failure of a
+//! slot that is still plugged ends the fill as `failed`.
 
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -21,8 +26,41 @@ use crate::vmm_config::space::{FillState, FillStatus};
 /// `MADV_POPULATE_WRITE` of Linux 5.14.
 const MADV_POPULATE_WRITE: libc::c_int = 23;
 
-/// One range of guest memory in the address space of the process: its address and its length.
-pub type HostRange = (usize, usize);
+/// Whether a slot of guest memory is still plugged, read when its populate fails.
+pub type StillPlugged = Box<dyn Fn() -> bool + Send>;
+
+/// One slot of guest memory in the address space of the process: its address, its length, and
+/// for a slot of a hotplug region the reading of whether it is still plugged (none: a slot that
+/// cannot be unplugged, whose failure always ends the fill).
+pub struct HostRange {
+    /// The address of the slot.
+    pub addr: usize,
+    /// Its length.
+    pub len: usize,
+    /// Whether it is still plugged.
+    pub plugged: Option<StillPlugged>,
+}
+
+impl std::fmt::Debug for HostRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostRange")
+            .field("addr", &self.addr)
+            .field("len", &self.len)
+            .field("hotplug", &self.plugged.is_some())
+            .finish()
+    }
+}
+
+impl HostRange {
+    /// A slot that cannot be unplugged.
+    pub fn fixed(addr: usize, len: usize) -> HostRange {
+        HostRange {
+            addr,
+            len,
+            plugged: None,
+        }
+    }
+}
 
 /// Errors of a fill.
 #[derive(Debug, thiserror::Error, displaydoc::Display, PartialEq, Eq)]
@@ -57,7 +95,13 @@ impl Filler {
                     let result = populate_write(&ranges);
                     let mut status = thread_status.lock().expect("Poisoned lock");
                     *status = match result {
-                        Ok(()) => {
+                        Ok(skipped) => {
+                            if skipped > 0 {
+                                info!(
+                                    "The fill of guest memory is done; {skipped} slots unplugged \
+                                     during it were skipped."
+                                );
+                            }
                             info!("The fill of guest memory is done.");
                             FillStatus {
                                 state: FillState::Done,
@@ -104,26 +148,34 @@ impl Filler {
     }
 }
 
-/// Populates each range for writing. A page that is there keeps its bytes; a page of a private
+/// Populates each slot for writing. A page that is there keeps its bytes; a page of a private
 /// file mapping gets a copy of its own; a page that is not there becomes a zero page, or is asked
-/// for from the UFFD handler of a range that one serves.
-fn populate_write(ranges: &[HostRange]) -> std::io::Result<()> {
-    for &(addr, len) in ranges {
+/// for from the UFFD handler of a range that one serves. A slot whose populate fails and that is
+/// no longer plugged (the guest unplugged it during the fill) is skipped. Returns the number of
+/// slots skipped.
+fn populate_write(ranges: &[HostRange]) -> std::io::Result<usize> {
+    let mut skipped = 0;
+    for r in ranges {
         loop {
             // SAFETY: the range is guest memory that the process mapped and keeps mapped while
             // the Vmm lives; the advice changes no byte of it.
-            let ret = unsafe { libc::madvise(addr as *mut libc::c_void, len, MADV_POPULATE_WRITE) };
+            let ret =
+                unsafe { libc::madvise(r.addr as *mut libc::c_void, r.len, MADV_POPULATE_WRITE) };
             if ret == 0 {
                 break;
             }
             let err = std::io::Error::last_os_error();
             match err.raw_os_error() {
                 Some(libc::EINTR) | Some(libc::EAGAIN) => continue,
+                _ if r.plugged.as_ref().is_some_and(|plugged| !plugged()) => {
+                    skipped += 1;
+                    break;
+                }
                 _ => return Err(err),
             }
         }
     }
-    Ok(())
+    Ok(skipped)
 }
 
 #[cfg(test)]
@@ -180,7 +232,7 @@ mod tests {
 
         let filler = Filler::spawn(Arc::new(vec![])).unwrap();
         assert_eq!(filler.status().state, FillState::Idle);
-        filler.start(vec![(addr, len)]).unwrap();
+        filler.start(vec![HostRange::fixed(addr, len)]).unwrap();
         let status = wait_done(&filler);
         assert_eq!(status.state, FillState::Done, "{:?}", status.error);
         assert_eq!(resident_pages(addr, len), 64);
@@ -188,7 +240,7 @@ mod tests {
         assert_eq!(unsafe { *((addr + 4096) as *const u8) }, 0x5a);
 
         // A fill can run again after one ended.
-        filler.start(vec![(addr, len)]).unwrap();
+        filler.start(vec![HostRange::fixed(addr, len)]).unwrap();
         assert_eq!(wait_done(&filler).state, FillState::Done);
 
         // SAFETY: the mapping of this test.
@@ -211,12 +263,69 @@ mod tests {
         };
         assert_ne!(addr, libc::MAP_FAILED);
         let filler = Filler::spawn(Arc::new(vec![])).unwrap();
-        filler.start(vec![(addr as usize, len)]).unwrap();
+        filler.start(vec![HostRange::fixed(addr as usize, len)]).unwrap();
         let status = wait_done(&filler);
         assert_eq!(status.state, FillState::Failed);
         assert!(status.error.is_some());
+        // A slot of a hotplug region that is still plugged fails the fill in the same way.
+        filler
+            .start(vec![HostRange {
+                addr: addr as usize,
+                len,
+                plugged: Some(Box::new(|| true)),
+            }])
+            .unwrap();
+        assert_eq!(wait_done(&filler).state, FillState::Failed);
         // SAFETY: the mapping of this test.
         unsafe { libc::munmap(addr, len) };
+    }
+
+    /// Memory groups' S0 (2026-10-22): an unplug during a fill made the fill fail with
+    /// "Invalid argument". A slot that is no longer plugged when its populate fails is skipped,
+    /// and the slots after it are filled.
+    #[test]
+    fn test_fill_skips_a_slot_unplugged_during_it() {
+        let len = 16 * 4096;
+        let map = |prot| {
+            // SAFETY: an anonymous private mapping of this test.
+            let a = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    prot,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(a, libc::MAP_FAILED);
+            a as usize
+        };
+        // the first slot was unplugged before its turn came (PROT_NONE), the second is plugged
+        let (gone, kept) = (map(libc::PROT_NONE), map(libc::PROT_READ | libc::PROT_WRITE));
+        let filler = Filler::spawn(Arc::new(vec![])).unwrap();
+        filler
+            .start(vec![
+                HostRange {
+                    addr: gone,
+                    len,
+                    plugged: Some(Box::new(|| false)),
+                },
+                HostRange {
+                    addr: kept,
+                    len,
+                    plugged: Some(Box::new(|| true)),
+                },
+            ])
+            .unwrap();
+        let status = wait_done(&filler);
+        assert_eq!(status.state, FillState::Done, "{:?}", status.error);
+        assert_eq!(resident_pages(kept, len), 16);
+        // SAFETY: the mappings of this test.
+        unsafe {
+            libc::munmap(gone as *mut libc::c_void, len);
+            libc::munmap(kept as *mut libc::c_void, len);
+        }
     }
 
     #[test]
