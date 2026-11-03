@@ -43,6 +43,10 @@ const GUEST_MEMORY_ALIGNMENT: usize = mib_to_bytes(2);
 /// A mask to extract mmap's flags related to HUGETLB
 const HUGETLB_FLAG_MASK: libc::c_int = libc::MAP_HUGETLB | (0x3F << libc::MAP_HUGE_SHIFT);
 
+/// Whether guest memory was created with `madvise(MADV_HUGEPAGE)` (transparent huge pages), so that a fresh mapping
+/// of an unplugged hotplug block gets the same advice (one VM per process).
+static MADVISED_HUGEPAGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Errors associated with dumping guest memory to file.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum MemoryError {
@@ -731,6 +735,58 @@ impl GuestRegionMmapExt {
         Ok(())
     }
 
+    /// Maps [caddr, caddr + len) of the region afresh (MAP_FIXED with `flags`), slot by slot with the protection of
+    /// the slot (PROT_NONE for a slot that is unplugged), and gives it the region's MADV_HUGEPAGE again.
+    fn map_afresh(
+        &self,
+        caddr: MemoryRegionAddress,
+        len: usize,
+        flags: libc::c_int,
+    ) -> Result<(), GuestMemoryError> {
+        let base = self.start_addr().raw_value();
+        let from = base
+            .checked_add(caddr.raw_value())
+            .expect("caddr should be within the region");
+        let to = from
+            .checked_add(len as u64)
+            .expect("range should be within the region");
+        for (slot, plugged) in self.slots_intersecting_range(GuestAddress(from), len) {
+            let slot_start = slot.guest_addr.raw_value();
+            let slot_end = slot_start
+                .checked_add(slot.slice.len() as u64)
+                .expect("slot should be within the region");
+            let start = slot_start.max(from);
+            let end = slot_end.min(to);
+            let host = self.get_host_address(MemoryRegionAddress(start - base))?;
+            let prot = if plugged {
+                libc::PROT_READ | libc::PROT_WRITE
+            } else {
+                libc::PROT_NONE
+            };
+            let size = u64_to_usize(end - start);
+            // SAFETY: [start, end) is clamped to this slot, so `host` and the length are within the region's
+            // existing mapping. MAP_FIXED replaces exactly that range.
+            let ret = unsafe { libc::mmap(host.cast(), size, prot, libc::MAP_FIXED | flags, -1, 0) };
+            // MAP_FIXED has already unmapped the old range, so a failure here cannot be recovered from.
+            if ret == libc::MAP_FAILED {
+                panic!(
+                    "discard_range: mmap failed: {:?}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            if MADVISED_HUGEPAGE.load(std::sync::atomic::Ordering::Relaxed) {
+                // SAFETY: the range was just mapped.
+                if unsafe { libc::madvise(host.cast(), size, libc::MADV_HUGEPAGE) } != 0 {
+                    warn_unrestricted!(
+                        "discard_range: madvise(MADV_HUGEPAGE) failed: {:?}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn discard_range(
         &self,
         caddr: MemoryRegionAddress,
@@ -811,6 +867,28 @@ impl GuestRegionMmapExt {
                         );
                     }
                 }
+                Ok(())
+            }
+            // An anonymous private hotpluggable region (virtio-mem; not hugetlbfs): the range is discarded and
+            // then mapped afresh, so that the page tables of the range go too. MADV_DONTNEED alone keeps them, and
+            // a 2 MiB range whose page table stays gets pages of 4 KiB at every later fault there, never a huge
+            // page again (a host kernel without CONFIG_PT_RECLAIM). The madvise first: a userfaultfd that serves
+            // the range (memory that still follows after a move) gets its UFFD_EVENT_REMOVE and stops placing
+            // pages there before the range is replaced.
+            (None, flags)
+                if self.region_type == GuestRegionType::Hotpluggable
+                    && flags & libc::MAP_PRIVATE != 0
+                    && flags & libc::MAP_HUGETLB == 0 =>
+            {
+                let host_addr = self.get_host_address(caddr)?;
+                // SAFETY: The address and length are known to be valid.
+                let ret = unsafe { libc::madvise(host_addr.cast(), len, libc::MADV_DONTNEED) };
+                if ret < 0 {
+                    let os_error = std::io::Error::last_os_error();
+                    error!("discard_range: madvise failed: {:?}", os_error);
+                    return Err(GuestMemoryError::IOError(os_error));
+                }
+                self.map_afresh(caddr, len, libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_NORESERVE)?;
                 Ok(())
             }
             // Match either the case of an anonymous mapping, or the case
@@ -907,6 +985,9 @@ pub fn create(
             offset = offset
                 .checked_add(size as u64)
                 .ok_or(MemoryError::OffsetTooLarge)?;
+            if madvise_flags == libc::MADV_HUGEPAGE {
+                MADVISED_HUGEPAGE.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             if madvise_flags != libc::MADV_NORMAL {
                 // SAFETY: The referenced memory was just mapped.
                 let ret = unsafe {
@@ -1849,6 +1930,83 @@ mod tests {
                 .unwrap_err(),
             GuestMemoryError::InvalidGuestAddress(_)
         );
+    }
+
+    /// The AnonHugePages (kB) of the mappings of this process that start in [start, start + len).
+    fn anon_huge_kib(start: usize, len: usize) -> u64 {
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let mut inside = false;
+        let mut kib = 0;
+        for line in smaps.lines() {
+            if let Some((range, _)) = line.split_once(' ')
+                && let Some((a, _)) = range.split_once('-')
+                && let Ok(a) = usize::from_str_radix(a, 16)
+            {
+                inside = a >= start && a < start + len;
+                continue;
+            }
+            if inside && let Some(v) = line.strip_prefix("AnonHugePages:") {
+                kib += v.trim().trim_end_matches("kB").trim().parse::<u64>().unwrap();
+            }
+        }
+        kib
+    }
+
+    /// A 2 MiB range in a huge page, split by a discard of one page of it, then discarded whole and touched again:
+    /// in a hotpluggable region (virtio-mem) the discard maps the range afresh, so the touch gets a huge page again;
+    /// in boot memory the discard is a madvise, the page table of the split stays, and the touch gets a 4 KiB page.
+    #[test]
+    fn test_discard_range_maps_a_hotpluggable_range_afresh() {
+        let thp = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled").unwrap_or_default();
+        if thp.contains("[never]") {
+            eprintln!("SKIPPED: transparent huge pages are off on this host");
+            return;
+        }
+        let two_mib = mib_to_bytes(2);
+        let region_size = 2 * two_mib;
+        for hotpluggable in [true, false] {
+            let mmap_region = anonymous(
+                std::iter::once((GuestAddress(0), region_size)),
+                false,
+                HugePageConfig::Transparent,
+            )
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+            let region = if hotpluggable {
+                let r = GuestRegionMmapExt::hotpluggable_from_mmap_region(mmap_region, 0, region_size);
+                r.plugged.lock().unwrap().set(0, true);
+                r
+            } else {
+                GuestRegionMmapExt::dram_from_mmap_region(mmap_region, 0)
+            };
+            let base = region.as_ptr() as usize;
+            // SAFETY: the region's own memory.
+            unsafe { std::ptr::write_volatile(base as *mut u8, 1) };
+            assert_eq!(anon_huge_kib(base, region_size), 2048, "the first touch of the range");
+            // SAFETY: one page of the region's own memory.
+            unsafe { libc::madvise((base + 4096) as *mut c_void, 4096, libc::MADV_DONTNEED) };
+            assert_eq!(anon_huge_kib(base, region_size), 0, "a discard of one page splits the huge page");
+            region
+                .discard_range(MemoryRegionAddress(0), two_mib)
+                .unwrap();
+            // SAFETY: the region's own memory.
+            unsafe { std::ptr::write_volatile((base + 8192) as *mut u8, 2) };
+            let want = if hotpluggable { 2048 } else { 0 };
+            assert_eq!(anon_huge_kib(base, region_size), want, "hotpluggable {hotpluggable}");
+            // SAFETY: the region's own memory.
+            assert_eq!(unsafe { std::ptr::read_volatile(base as *const u8) }, 0);
+            if hotpluggable {
+                let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+                let head = format!("{:x}-", base);
+                let flags = smaps
+                    .split_once(&head)
+                    .and_then(|(_, rest)| rest.lines().find(|l| l.starts_with("VmFlags:")))
+                    .unwrap();
+                assert!(flags.contains(" hg"), "the fresh mapping keeps MADV_HUGEPAGE: {flags}");
+            }
+        }
     }
 
     #[test]
